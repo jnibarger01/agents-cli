@@ -36,6 +36,7 @@ _LOG_FILENAME = "run_server.log"
 _BASE_PORT = 18080
 _MAX_PORT_ATTEMPTS = 10
 _DEFAULT_IDLE_TIMEOUT = 1800  # 30 minutes
+_LOGGER = logging.getLogger(__name__)
 
 
 class ServerInfo(NamedTuple):
@@ -79,7 +80,7 @@ def ensure_server(
     info = _read_pid_file(project_root)
 
     if info:
-        if _is_server_alive(info["pid"], info["port"]):
+        if _is_server_alive(info["pid"], info["port"], info.get("create_time")):
             # Check idle timeout — stop the server if it's been idle too long.
             if _is_idle(info, idle_timeout):
                 _cleanup(project_root, info)
@@ -101,8 +102,20 @@ def ensure_server(
 
     port = _find_free_port()
     pid = _start_server(project_root, agent_dir, port, trace_to_cloud=trace_to_cloud)
-    _wait_for_port(port, pid=pid)
-    _write_pid_file(project_root, pid=pid, port=port, trace_to_cloud=trace_to_cloud)
+    create_time = _process_create_time(pid)
+    try:
+        _wait_for_port(port, pid=pid)
+    except click.ClickException:
+        # A failed readiness check must not leave an orphaned server behind.
+        _cleanup(project_root, {"pid": pid, "create_time": create_time})
+        raise
+    _write_pid_file(
+        project_root,
+        pid=pid,
+        port=port,
+        create_time=create_time,
+        trace_to_cloud=trace_to_cloud,
+    )
     click.secho(f"Local server started on port {port} (PID {pid})", dim=True)
     click.secho("  Stop with: agents-cli run --stop-server", dim=True)
     return ServerInfo(port, started=True)
@@ -131,7 +144,7 @@ def get_server_port(project_root: Path) -> int | None:
     info = _read_pid_file(project_root)
     if not info:
         return None
-    if not _is_server_alive(info["pid"], info["port"]):
+    if not _is_server_alive(info["pid"], info["port"], info.get("create_time")):
         return None
     return info["port"]
 
@@ -194,8 +207,7 @@ def _start_server(
     env = os.environ.copy()
     env.setdefault("USE_IN_MEMORY_SESSION", "true")
 
-    log_file = open(log_path, "a", encoding="utf-8")
-    try:
+    with open(log_path, "a", encoding="utf-8") as log_file:
         proc = popen_resolved_detached(
             cmd,
             cwd=str(project_root),
@@ -203,9 +215,6 @@ def _start_server(
             stderr=log_file,
             env=env,
         )
-    finally:
-        # Close the parent's copy of the fd — the child inherits its own.
-        log_file.close()
     return proc.pid
 
 
@@ -255,9 +264,26 @@ def _read_pid_file(project_root: Path) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         return None
+    if not isinstance(data, dict):
+        return None
+    pid = data.get("pid")
+    port = data.get("port")
+    create_time = data.get("create_time")
+    if (
+        type(pid) is not int
+        or pid <= 0
+        or type(port) is not int
+        or not 1 <= port <= 65535
+        or (
+            create_time is not None
+            and not isinstance(create_time, (int, float))
+        )
+    ):
+        return None
+    return data
 
 
 def _write_pid_file(
@@ -265,12 +291,14 @@ def _write_pid_file(
     *,
     pid: int,
     port: int,
+    create_time: float | None,
     trace_to_cloud: bool = False,
 ) -> None:
     now = datetime.now(UTC).isoformat()
     data = {
         "pid": pid,
         "port": port,
+        "create_time": create_time,
         "started_at": now,
         "last_activity": now,
         "trace_to_cloud": trace_to_cloud,
@@ -302,11 +330,15 @@ def _is_idle(info: dict, idle_timeout: int) -> bool:
         return True
 
 
-def _is_server_alive(pid: int, port: int) -> bool:
-    """Return ``True`` if the process exists AND the port is open."""
-    try:
-        os.kill(pid, 0)
-    except OSError:
+def _is_server_alive(pid: int, port: int, create_time: float | None = None) -> bool:
+    """Return whether the recorded process owns the port.
+
+    The creation time prevents a recycled PID from being mistaken for the
+    local server. In particular, callers must not terminate a process based
+    only on a stale PID file.
+    """
+    process = _owned_process(pid, create_time)
+    if process is None:
         return False
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=1):
@@ -315,26 +347,51 @@ def _is_server_alive(pid: int, port: int) -> bool:
         return False
 
 
+def _process_create_time(pid: int) -> float | None:
+    """Return a process creation timestamp, or ``None`` if it exited."""
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+        return None
+
+
+def _owned_process(pid: int, create_time: float | None) -> psutil.Process | None:
+    """Return the process only when the PID file still identifies it."""
+    if create_time is None:
+        return None
+    try:
+        process = psutil.Process(pid)
+        if process.create_time() != create_time:
+            return None
+        return process
+    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+        return None
+
+
 def _cleanup(project_root: Path, info: dict) -> None:
     """Terminate the server process and remove the PID file."""
     pid = info.get("pid")
-    if pid:
+    process = _owned_process(pid, info.get("create_time")) if pid else None
+    if process:
         try:
-            parent = psutil.Process(pid)
-            children = parent.children(recursive=True)
+            children = process.children(recursive=True)
             for child in children:
                 try:
                     child.terminate()
                 except psutil.NoSuchProcess:
                     pass
-            parent.terminate()
-            psutil.wait_procs([*children, parent], timeout=3)
+            process.terminate()
+            psutil.wait_procs([*children, process], timeout=3)
         except psutil.NoSuchProcess:
-            logging.warning(
-                "Local server process with PID %d not found, skipping termination.", pid
-            )
+            pass
+    elif pid:
+        _LOGGER.warning(
+            "Skipping termination of PID %d because its process identity could not "
+            "be verified.",
+            pid,
+        )
     path = _pid_file_path(project_root)
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        logging.warning("Failed to remove PID file %s: %s", path, exc)
+        _LOGGER.warning("Failed to remove PID file %s: %s", path, exc)
