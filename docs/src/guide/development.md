@@ -57,6 +57,10 @@ Edit your agent logic in `app/agent.py` and test with:
 
 - `agents-cli playground` — launches the ADK web playground at `localhost:8080` with hot reload
 - `agents-cli run "your prompt"` — quick smoke test from the terminal
+- If a local run server cannot become ready, the CLI terminates the newly
+  started process. A stale `.google-agents-cli/run_server.json` is ignored
+  unless its recorded process identity still matches, so inspect
+  `.google-agents-cli/run_server.log` when recovering from an interrupted run.
 
 ### Code Quality
 
