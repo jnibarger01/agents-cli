@@ -1,0 +1,286 @@
+name: Jace PR Review & Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to re-evaluate
+        required: true
+        type: number
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+  actions: read
+
+concurrency:
+  group: jace-pr-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: true
+
+jobs:
+  review-and-merge:
+    name: PR review and merge gate
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.pull_request.user.login == 'jnibarger01' && github.event.pull_request.draft == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Review, gate, and merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PR="$PR_NUMBER"
+          OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO="${GITHUB_REPOSITORY#*/}"
+          MARKER='<!-- jace-pr-review-gate -->'
+
+          upsert_comment() {
+            local body="$1"
+            local full
+            full="$MARKER"$'\n'"$body"
+            local id
+            id="$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate               --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | contains("<!-- jace-pr-review-gate -->"))) | .id'               | tail -n 1 || true)"
+            if [[ -n "$id" ]]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$full" >/dev/null
+            else
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$full" >/dev/null
+            fi
+          }
+
+          pr_json="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          author="$(jq -r '.user.login' <<<"$pr_json")"
+          draft="$(jq -r '.draft' <<<"$pr_json")"
+
+          if [[ "$author" != "jnibarger01" ]]; then
+            echo "Ignoring PR #$PR: author is $author."
+            exit 0
+          fi
+
+          if [[ "$draft" == "true" ]]; then
+            echo "Ignoring PR #$PR while it is a draft."
+            exit 0
+          fi
+
+          policy_changes="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate \
+            --jq '.[] | select(.filename == ".github/workflows/jnibarger01-pr-review-merge.yml" or .filename == ".github/instructions/jnibarger01-pr-review.instructions.md") | .filename')"
+          if [[ -n "$policy_changes" ]]; then
+            upsert_comment "BLOCK — this PR changes the automated review/merge policy itself. Self-modifying gate changes require manual review and will not be auto-merged.
+
+            Files:
+            \`\`\`
+            $policy_changes
+            \`\`\`"
+            exit 1
+          fi
+
+          # Request a fresh Copilot review. This is the semantic review for
+          # correctness, security, regressions, scope, and test adequacy.
+          if ! review_request="$(gh pr edit "$PR" -R "$GITHUB_REPOSITORY" --add-reviewer @copilot 2>&1)"; then
+            upsert_comment "BLOCK — GitHub Copilot code review could not be requested. No merge was attempted.
+
+            Fix: enable Copilot code review for this repository/account, then re-run **Jace PR Review & Auto-Merge**.
+
+            Details: \`$review_request\`"
+            exit 1
+          fi
+
+          ready=false
+          last_reason="waiting for review/check state"
+
+          for attempt in $(seq 1 40); do
+            snapshot="$(gh api graphql               -f owner="$OWNER"               -f repo="$REPO"               -F number="$PR"               -f query='
+                query($owner: String!, $repo: String!, $number: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $number) {
+                      state
+                      isDraft
+                      mergeable
+                      reviewDecision
+                      headRefOid
+                      reviews(last: 100) {
+                        nodes {
+                          author { login }
+                          state
+                          submittedAt
+                          commit { oid }
+                        }
+                      }
+                      reviewThreads(first: 100) {
+                        nodes {
+                          isResolved
+                          comments(first: 20) {
+                            nodes {
+                              author { login }
+                              body
+                              url
+                            }
+                          }
+                        }
+                        pageInfo { hasNextPage }
+                      }
+                      commits(last: 1) {
+                        nodes {
+                          commit {
+                            statusCheckRollup {
+                              contexts(first: 100) {
+                                nodes {
+                                  __typename
+                                  ... on CheckRun {
+                                    name
+                                    status
+                                    conclusion
+                                    app { slug }
+                                  }
+                                  ... on StatusContext {
+                                    context
+                                    state
+                                  }
+                                }
+                                pageInfo { hasNextPage }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }')"
+
+            state="$(jq -r '.data.repository.pullRequest.state' <<<"$snapshot")"
+            is_draft="$(jq -r '.data.repository.pullRequest.isDraft' <<<"$snapshot")"
+            mergeable="$(jq -r '.data.repository.pullRequest.mergeable' <<<"$snapshot")"
+            review_decision="$(jq -r '.data.repository.pullRequest.reviewDecision // "NONE"' <<<"$snapshot")"
+            head_sha="$(jq -r '.data.repository.pullRequest.headRefOid' <<<"$snapshot")"
+            more_threads="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<<"$snapshot")"
+            more_checks="$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.pageInfo.hasNextPage // false' <<<"$snapshot")"
+
+            if [[ "$state" != "OPEN" || "$is_draft" == "true" ]]; then
+              echo "PR #$PR is no longer an open, non-draft PR."
+              exit 0
+            fi
+
+            if [[ "$more_threads" == "true" || "$more_checks" == "true" ]]; then
+              upsert_comment "BLOCK — the PR has more than 100 review threads or status checks, which this gate will not truncate. No merge was attempted."
+              exit 1
+            fi
+
+            if [[ "$mergeable" == "CONFLICTING" ]]; then
+              upsert_comment "BLOCK — PR #$PR has merge conflicts. Resolve the conflicts and push the updated branch; the gate will run again."
+              exit 1
+            fi
+
+            if [[ "$review_decision" == "CHANGES_REQUESTED" ]]; then
+              upsert_comment "BLOCK — at least one submitted review currently requests changes. Address the review and push/re-request review before merging."
+              exit 1
+            fi
+
+            unresolved="$(jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length' <<<"$snapshot")"
+            if (( unresolved > 0 )); then
+              upsert_comment "BLOCK — $unresolved review thread(s) remain unresolved. Resolve legitimate blocking findings before merging."
+              exit 1
+            fi
+
+            copilot_current="$(jq --arg sha "$head_sha" '
+              [.data.repository.pullRequest.reviews.nodes[]
+               | select((.author.login // "" | startswith("copilot-pull-request-reviewer"))
+                        and (.commit.oid // "") == $sha)]
+              | length' <<<"$snapshot")"
+
+            pending_checks="$(jq '
+              [.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+               | select(
+                   (.__typename == "CheckRun"
+                    and .name != "PR review and merge gate"
+                    and .status != "COMPLETED")
+                   or
+                   (.__typename == "StatusContext"
+                    and (.state == "PENDING" or .state == "EXPECTED"))
+                 )]
+              | length' <<<"$snapshot")"
+
+            failed_checks="$(jq '
+              [.data.repository.pullRequest.commits.nodes[0].commit.statusCheckRollup.contexts.nodes[]?
+               | select(
+                   (.__typename == "CheckRun"
+                    and .name != "PR review and merge gate"
+                    and .status == "COMPLETED"
+                    and ((.conclusion // "") != "SUCCESS")
+                    and ((.conclusion // "") != "NEUTRAL")
+                    and ((.conclusion // "") != "SKIPPED"))
+                   or
+                   (.__typename == "StatusContext"
+                    and .state != "SUCCESS"
+                    and .state != "PENDING"
+                    and .state != "EXPECTED")
+                 )]
+              | length' <<<"$snapshot")"
+
+            if (( failed_checks > 0 )); then
+              upsert_comment "BLOCK — $failed_checks status check(s) are failing/cancelled. All CI checks must be successful, neutral, or skipped before this automation will merge."
+              exit 1
+            fi
+
+            if [[ "$mergeable" == "UNKNOWN" ]]; then
+              last_reason="GitHub is still computing mergeability"
+            elif (( copilot_current == 0 )); then
+              last_reason="waiting for a Copilot review of head $head_sha"
+            elif (( pending_checks > 0 )); then
+              last_reason="waiting for $pending_checks pending status check(s)"
+            else
+              ready=true
+              break
+            fi
+
+            echo "Attempt $attempt/40: $last_reason"
+            sleep 30
+          done
+
+          if [[ "$ready" != "true" ]]; then
+            upsert_comment "BLOCK — timed out while $last_reason. No merge was attempted. Re-run **Jace PR Review & Auto-Merge** after the prerequisite completes."
+            exit 1
+          fi
+
+          # Re-read immediately before merge so a moved head cannot slip through.
+          final_pr="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR")"
+          final_head="$(jq -r '.head.sha' <<<"$final_pr")"
+          final_mergeable="$(jq -r '.mergeable' <<<"$final_pr")"
+          if [[ "$final_head" != "$head_sha" || "$final_mergeable" != "true" ]]; then
+            upsert_comment "BLOCK — PR state changed during review (head moved or GitHub no longer reports it mergeable). No merge was attempted."
+            exit 1
+          fi
+
+          repo_json="$(gh api "repos/$GITHUB_REPOSITORY")"
+          if [[ "$(jq -r '.allow_merge_commit' <<<"$repo_json")" == "true" ]]; then
+            method="merge"
+          elif [[ "$(jq -r '.allow_squash_merge' <<<"$repo_json")" == "true" ]]; then
+            method="squash"
+          elif [[ "$(jq -r '.allow_rebase_merge' <<<"$repo_json")" == "true" ]]; then
+            method="rebase"
+          else
+            upsert_comment "BLOCK — repository settings expose no allowed pull-request merge method."
+            exit 1
+          fi
+
+          if ! merge_json="$(gh api               -H 'X-GitHub-Api-Version: 2026-03-10'               -X PUT "repos/$GITHUB_REPOSITORY/pulls/$PR/merge"               -f sha="$head_sha"               -f merge_method="$method"               -f merge_action=default 2>&1)"; then
+            upsert_comment "BLOCK — GitHub rejected the merge after the review gate passed. Repository protections were not bypassed.
+
+            Details: \`$merge_json\`"
+            exit 1
+          fi
+
+          if [[ "$(jq -r '.merged // false' <<<"$merge_json")" != "true" ]]; then
+            message="$(jq -r '.message // "GitHub did not merge the pull request."' <<<"$merge_json")"
+            upsert_comment "BLOCK — GitHub did not merge PR #$PR: $message"
+            exit 1
+          fi
+
+          echo "Merged PR #$PR using repository-allowed method: $method."
